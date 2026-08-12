@@ -443,13 +443,13 @@ class RasterDataset(GeoDataset):
                 (``is_image=False``), single-band data may have the channel
                 dimension squeezed, resulting in shapes ``[T, H, W]`` or
                 ``[H, W]`` when ``C == 1``.
-            preload: if True, read every file into memory once, after warping,
-                so that repeated sampling does not decompress or re-read the
-                same data. This trades memory for speed and is only practical
-                when the warped dataset fits in RAM. Unlike *cache*, which only
-                caches file handles, this caches the data itself. Note that for
-                files that must be reprojected, preloading resamples once up
-                front, so sampled values differ slightly from ``preload=False``.
+            preload: if True, read every file into memory once, uncompressed, so
+                that repeated sampling does not decompress or re-read the same
+                data. Files are stored in their original CRS and grid and are
+                still warped per read, so sampled values are unchanged. This
+                trades memory for speed and is only practical when the
+                uncompressed dataset fits in RAM. Unlike *cache*, which caches
+                file handles, this caches the data itself.
 
         Raises:
             AssertionError: If *bands* are invalid.
@@ -550,15 +550,11 @@ class RasterDataset(GeoDataset):
             self._preload_files()
 
     def _preload_files(self) -> None:
-        """Read every file into memory, warping it to the CRS of the dataset.
+        """Read every file into memory, uncompressed.
 
-        Files are stored as uncompressed in-memory GeoTIFFs so that
-        :func:`rasterio.merge.merge` can read them exactly as it reads files on
-        disk, without decompressing anything a second time.
-
-        Warns:
-            UserWarning: If any file has to be reprojected, since preloading
-                then changes the values that sampling returns.
+        The data is stored in its original CRS and grid, so reads go through the
+        same warping path as they do from disk and return the same values. Only
+        the decompression and the disk read are avoided.
         """
         filepaths = list(self.index.filepath)
         if self.separate_files:
@@ -568,23 +564,9 @@ class RasterDataset(GeoDataset):
                 for band in self.bands
             ]
 
-        warped = 0
         for filepath in filepaths:
             if filepath not in self._preload_cache:
-                data, needs_warp = self._serialize_file(filepath)
-                self._preload_cache[filepath] = data
-                warped += needs_warp
-
-        if warped:
-            warnings.warn(
-                f'{warped} of {len(filepaths)} files need to be reprojected to the '
-                'CRS of the dataset. Preloading resamples them once up front, so '
-                'sampling returns slightly different values than it would with '
-                '`preload=False`, which resamples straight from the source pixels '
-                'to each requested patch. Reproject the files ahead of time to '
-                'avoid this.',
-                UserWarning,
-            )
+                self._preload_cache[filepath] = self._serialize_file(filepath)
 
         num_bytes = sum(map(len, self._preload_cache.values()))
         print(
@@ -592,18 +574,21 @@ class RasterDataset(GeoDataset):
             f'({num_bytes / 1000**3:.2f} GB) into memory.'
         )
 
-    def _serialize_file(self, filepath: Path) -> tuple[bytes, bool]:
-        """Warp a file and serialize it as an uncompressed in-memory GeoTIFF.
+    def _serialize_file(self, filepath: Path) -> bytes:
+        """Read a file and serialize it as an uncompressed in-memory GeoTIFF.
+
+        The file is deliberately *not* warped here. Warping a file to an
+        intermediate grid and then sampling from that grid resamples twice,
+        which changes the values that sampling returns.
 
         Args:
-            filepath: file to load and warp
+            filepath: file to read
 
         Returns:
-            the warped file contents, and whether warping was required
+            the uncompressed file contents
         """
         with ExitStack() as stack:
-            src = stack.enter_context(self._load_warp_file(filepath))
-            needs_warp = isinstance(src, WarpedVRT)
+            src = stack.enter_context(rasterio.open(filepath))
             profile = src.profile
             profile.update(driver='GTiff', tiled=False)
             # Compression is what preloading exists to avoid paying for repeatedly.
@@ -612,22 +597,20 @@ class RasterDataset(GeoDataset):
             with memfile.open(**profile) as dst:
                 dst.write(src.read())
             data: bytes = bytes(memfile.getbuffer())
-        return data, needs_warp
+        return data
 
-    @functools.lru_cache(maxsize=None)  # noqa: B019
-    def _cached_open_preloaded(self, filepath: Path) -> DatasetReader:
-        """Open a preloaded file, reusing the handle on subsequent calls.
-
-        Handles are opened lazily, rather than stored by :meth:`_preload_files`,
-        so that the dataset remains picklable and each worker process opens its
-        own handle to the shared data.
+    def _open_file(self, filepath: Path) -> DatasetReader:
+        """Open a file, reading from memory if it has been preloaded.
 
         Args:
             filepath: file to open
 
         Returns:
-            file handle of the in-memory file
+            file handle
         """
+        if filepath not in self._preload_cache:
+            return rasterio.open(filepath)
+
         memfile = MemoryFile(self._preload_cache[filepath])
         dataset = memfile.open()
         # The dataset reads straight out of the MemoryFile's buffer, so the
@@ -763,9 +746,7 @@ class RasterDataset(GeoDataset):
             image/mask at that index
         """
         out_crs = out_crs or self.crs
-        if self.preload:
-            vrt_fhs = [self._cached_open_preloaded(fp) for fp in filepaths]
-        elif self.cache:
+        if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp, out_crs) for fp in filepaths]
         else:
             vrt_fhs = [self._load_warp_file(fp, out_crs) for fp in filepaths]
@@ -821,7 +802,7 @@ class RasterDataset(GeoDataset):
         Raises:
             ValueError: If dataset has no usable affine CRS/transform and no GCP CRS.
         """
-        src = rasterio.open(filepath)
+        src = self._open_file(filepath)
 
         has_meaningful_affine = (
             src.transform is not None and not src.transform.is_identity

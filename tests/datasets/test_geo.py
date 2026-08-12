@@ -518,11 +518,15 @@ class TestRasterDataset:
             lazy[lazy.bounds]['image'], preloaded[preloaded.bounds]['image']
         )
 
-    def test_preload_warns_when_reprojecting(self) -> None:
+    def test_preload_matches_lazy_reads_when_reprojecting(self) -> None:
+        # Preloaded files are stored in their original grid, so warping still
+        # happens per read and the values are unchanged.
         crs = CRS.from_epsg(4326)
-        msg = 'files need to be reprojected'
-        with pytest.warns(UserWarning, match=msg):
-            NAIP(self.naip_dir, crs=crs, preload=True)
+        lazy = NAIP(self.naip_dir, crs=crs)
+        preloaded = NAIP(self.naip_dir, crs=crs, preload=True)
+        assert torch.equal(
+            lazy[lazy.bounds]['image'], preloaded[preloaded.bounds]['image']
+        )
 
     def test_preload_is_picklable(self) -> None:
         ds = NAIP(self.naip_dir, preload=True)
