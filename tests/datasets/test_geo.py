@@ -87,6 +87,18 @@ class CustomRasterDataset(RasterDataset):
         return self._dtype
 
 
+class CustomSeparateFilesDataset(RasterDataset):
+    filename_glob = 'T*_B02_*.jp2'
+    filename_regex = r"""
+        ^T(?P<tile>\d{2}[A-Z]{3})
+        _(?P<date>\d{8}T\d{6})
+        _(?P<band>B\d{2})
+    """
+    date_format = '%Y%m%dT%H%M%S'
+    all_bands = ('B02', 'B03', 'B04', 'B08')
+    separate_files = True
+
+
 class CustomVectorDataset(VectorDataset):
     filename_glob = '*.geojson'
     date_format = '%Y'
@@ -484,6 +496,44 @@ class TestRasterDataset:
         warped = ds._cached_load_warp_file(filepath, CRS.from_epsg(4326))
         assert isinstance(warped, WarpedVRT)
         assert warped.crs != native.crs
+
+    @pytest.mark.parametrize('time_series', [True, False])
+    @pytest.mark.parametrize('is_image', [True, False])
+    def test_preload_matches_lazy_reads(
+        self, time_series: bool, is_image: bool
+    ) -> None:
+        lazy = NAIP(self.naip_dir, time_series=time_series)
+        preloaded = NAIP(self.naip_dir, time_series=time_series, preload=True)
+        lazy.is_image = preloaded.is_image = is_image
+        key = 'image' if is_image else 'mask'
+        assert torch.equal(lazy[lazy.bounds][key], preloaded[preloaded.bounds][key])
+
+    @pytest.mark.parametrize(
+        'bands', [('B04', 'B03', 'B02'), ('B02', 'B03', 'B04', 'B08')]
+    )
+    def test_preload_separate_files(self, bands: tuple[str, ...]) -> None:
+        lazy = CustomSeparateFilesDataset(self.s2_dir, bands=bands)
+        preloaded = CustomSeparateFilesDataset(self.s2_dir, bands=bands, preload=True)
+        # Every band of every file is preloaded, not just the indexed filepaths.
+        assert len(preloaded._preload_cache) == len(lazy.files) * len(bands)
+        assert torch.equal(
+            lazy[lazy.bounds]['image'], preloaded[preloaded.bounds]['image']
+        )
+
+    def test_preload_matches_lazy_reads_when_reprojecting(self) -> None:
+        # Preloaded files are stored in their original grid, so warping still
+        # happens per read and the values are unchanged.
+        crs = CRS.from_epsg(4326)
+        lazy = NAIP(self.naip_dir, crs=crs)
+        preloaded = NAIP(self.naip_dir, crs=crs, preload=True)
+        assert torch.equal(
+            lazy[lazy.bounds]['image'], preloaded[preloaded.bounds]['image']
+        )
+
+    def test_preload_is_picklable(self) -> None:
+        ds = NAIP(self.naip_dir, preload=True)
+        ds[ds.bounds]
+        assert isinstance(pickle.loads(pickle.dumps(ds)), NAIP)
 
     @pytest.mark.parametrize('dtype', ['uint16', 'uint32'])
     def test_getitem_uint_dtype(self, dtype: str) -> None:
