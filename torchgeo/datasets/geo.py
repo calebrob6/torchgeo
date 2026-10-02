@@ -743,8 +743,9 @@ class RasterDataset(GeoDataset):
                 outs.append(torch.full(shape, fill, device=self.device))
 
             # Source pixel coordinates of the output pixel centers
-            xy = _transformer(out_crs, src_crs, always_xy=True).transform(xs, ys)
-            cols, rows = ~transform * xy
+            xx, yy = _transformer(out_crs, src_crs, always_xy=True).transform(xs, ys)
+            t = ~transform
+            cols, rows = t.a * xx + t.b * yy + t.c, t.d * xx + t.e * yy + t.f
             c0, r0 = max(int(cols.min()) - 2, 0), max(int(rows.min()) - 2, 0)
             c1 = min(int(cols.max()) + 3, src.width)
             r1 = min(int(rows.max()) + 3, src.height)

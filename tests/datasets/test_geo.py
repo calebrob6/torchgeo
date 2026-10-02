@@ -42,7 +42,7 @@ from torchgeo.datasets import (
     XarrayDataset,
 )
 from torchgeo.datasets.utils import GeoSlice, Sample
-from torchgeo.samplers import GridGeoSampler
+from torchgeo.samplers import GriddedPatchSampler
 
 MINT = pd.Timestamp(2025, 4, 24)
 MAXT = pd.Timestamp(2025, 4, 25)
@@ -73,9 +73,9 @@ def sentinel2_utm(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
             x, y = Transformer.from_crs(4326, src.crs, always_xy=True).transform(
                 6.8, 51.8
             )
-            row, col = src.index(x, y)
+            col, row = ~src.transform @ (x, y)
             size = round(2560 / src.res[0])
-            row, col = row - size // 2, col - size // 2
+            row, col = int(row) - size // 2, int(col) - size // 2
             window = Window.from_slices((row, row + size), (col, col + size))
             profile = {k: src.profile[k] for k in ['driver', 'dtype', 'count', 'crs']}
             profile |= {'width': size, 'height': size, 'nodata': src.nodata}
@@ -117,7 +117,7 @@ def warp_reference(dataset: GeoDataset, query: GeoSlice) -> Tensor:
 def assert_device_matches(dataset: GeoDataset, device: GeoDataset) -> None:
     """Compare the PyTorch backend with GDAL and the rasterio backend."""
     actual, expected, reference = [], [], []
-    for query in GridGeoSampler(dataset, size=64, stride=64):
+    for query in GriddedPatchSampler(dataset, size=64):
         actual.append(device[query]['image'].cpu())
         expected.append(dataset[query]['image'])
         reference.append(warp_reference(dataset, query))
@@ -696,8 +696,8 @@ class TestRasterDataset:
     ) -> None:
         # Bilinear resampling and box blurs preserve a linear ramp, so the output is
         # exact, even if rotated, reprojected, or downsampled
-        transform = Affine.translation(7e5, 5.8e6) * Affine.rotation(30)
-        transform *= Affine.scale(10, -10)
+        transform = Affine.translation(7e5, 5.8e6) @ Affine.rotation(30)
+        transform @= Affine.scale(10, -10)
         profile: dict[str, Any] = {
             'driver': 'GTiff',
             'height': 64,
@@ -724,7 +724,7 @@ class TestRasterDataset:
         xs = x.start + (np.arange(w) + 0.5) * x.step
         ys = y.stop - (np.arange(h) + 0.5) * y.step
         transformer = Transformer.from_crs(ds.crs, profile['crs'], always_xy=True)
-        cols, rows = ~transform * transformer.transform(*np.meshgrid(xs, ys))
+        cols, rows = ~transform @ transformer.transform(*np.meshgrid(xs, ys))
         ramp = torch.tensor(1000 + 10 * rows + 7 * cols - 8.5, dtype=torch.float32)
         m = 1 + 2 * scale
         interior = torch.tensor(
