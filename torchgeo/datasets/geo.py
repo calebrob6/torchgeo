@@ -569,7 +569,12 @@ class RasterDataset(GeoDataset):
 
         out_crs = self.crs
 
-        if self.separate_files:
+        if self.separate_files and self.device is not None:
+            paths = [
+                [self._update_filepath(b, f) for b in self.bands] for f in df.filepath
+            ]
+            data = self._grid_sample(paths, index, None, out_crs)
+        elif self.separate_files:
             data_list: list[Tensor] = []
             for band in self.bands:
                 band_filepaths = []
@@ -673,7 +678,8 @@ class RasterDataset(GeoDataset):
         """
         out_crs = out_crs or self.crs
         if self.device is not None:
-            return self._grid_sample(filepaths, index, band_indexes, out_crs)
+            paths = [[filepath] for filepath in filepaths]
+            return self._grid_sample(paths, index, band_indexes, out_crs)
 
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp, out_crs) for fp in filepaths]
@@ -699,7 +705,7 @@ class RasterDataset(GeoDataset):
 
     def _grid_sample(
         self,
-        filepaths: Sequence[str],
+        filepaths: Sequence[Sequence[str]],
         index: GeoSlice,
         band_indexes: Sequence[int] | None,
         out_crs: PROJ_CRS,
@@ -712,9 +718,10 @@ class RasterDataset(GeoDataset):
         where the first valid pixel wins.
 
         Args:
-            filepaths: one or more files to load and merge
+            filepaths: groups of files to load and merge, where the files in each
+                group are stacked as bands (e.g., one file per band)
             index: [xmin:xmax:xres, ymin:ymax:yres, tmin:tmax:tres] coordinates to index.
-            band_indexes: indexes of bands to be used
+            band_indexes: indexes of bands to be used from each file
             out_crs: :term:`coordinate reference system (CRS)` to warp to
 
         Returns:
@@ -727,58 +734,78 @@ class RasterDataset(GeoDataset):
         ys = y.stop - (np.linspace(0, h - 1, h // 32 + 2) + 0.5) * y.step
         xs, ys = np.meshgrid(xs, ys)
         mode = {'cubic': 'bicubic'}.get(self.resampling.name, self.resampling.name)
+        load = self._cached_load_warp_file if self.cache else self._load_warp_file
+        # Pinned memory makes copies to the GPU asynchronous, so reading the next
+        # file overlaps with resampling the previous one
+        pin = str(self.device).startswith('cuda')
         outs: list[Tensor] = []
-        for filepath in filepaths:
-            if self.cache:
-                src = self._cached_load_warp_file(filepath, out_crs, False)
-            else:
-                src = self._load_warp_file(filepath, out_crs, False)
-            src_crs, transform = src.crs, src.transform
-            if transform.is_identity:
-                src_crs, transform = self._compute_affine_georeferencing(src)
-            nodata = self.nodata if self.nodata is not None else src.nodata
-            if self.time_series or not outs:
+        for paths in filepaths:
+            srcs = [load(path, out_crs, False) for path in paths]
+            nodata = self.nodata if self.nodata is not None else srcs[0].nodata
+            n = len(band_indexes or srcs[0].indexes)
+            first = self.time_series or not outs
+            if first:
                 fill = nodata or 0.0
-                shape = (len(band_indexes or src.indexes), h, w)
+                shape = (n * len(srcs), h, w)
                 outs.append(torch.full(shape, fill, device=self.device))
 
-            # Source pixel coordinates of the output pixel centers
-            xx, yy = _transformer(out_crs, src_crs, always_xy=True).transform(xs, ys)
-            t = ~transform
-            cols, rows = t.a * xx + t.b * yy + t.c, t.d * xx + t.e * yy + t.f
-            c0, r0 = max(int(cols.min()) - 2, 0), max(int(rows.min()) - 2, 0)
-            c1 = min(int(cols.max()) + 3, src.width)
-            r1 = min(int(rows.max()) + 3, src.height)
-            if c0 >= c1 or r0 >= r1:
-                continue
+            # Bands from files with the same pixel grid are resampled together
+            groups: dict[tuple[Any, ...], list[int]] = {}
+            for i, src in enumerate(srcs):
+                src_crs, transform = src.crs, src.transform
+                if transform.is_identity:
+                    src_crs, transform = self._compute_affine_georeferencing(src)
+                key = (src_crs, transform, src.width, src.height)
+                groups.setdefault(key, []).append(i)
 
-            array = src.read(band_indexes, window=((r0, r1), (c0, c1)))
-            data = torch.from_numpy(array.astype(np.float32)).to(self.device)
-            valid = ~data.isnan()
-            if nodata is not None:
-                valid &= data != nodata
-            grid = np.stack([(cols - c0) / (c1 - c0), (rows - r0) / (r1 - r0)])
-            grid = torch.tensor(grid * 2 - 1, device=self.device).float()[None]
-            grid = F.interpolate(grid, (h, w), mode='bilinear', align_corners=True)
-            sample = functools.partial(
-                F.grid_sample, grid=grid.permute(0, 2, 3, 1), align_corners=False
-            )
+            for (src_crs, transform, width, height), group in groups.items():
+                # Source pixel coordinates of the output pixel centers
+                transformer = _transformer(out_crs, src_crs, always_xy=True)
+                xx, yy = transformer.transform(xs, ys)
+                t = ~transform
+                cols, rows = t.a * xx + t.b * yy + t.c, t.d * xx + t.e * yy + t.f
+                c0, r0 = max(int(cols.min()) - 2, 0), max(int(rows.min()) - 2, 0)
+                c1 = min(int(cols.max()) + 3, width)
+                r1 = min(int(rows.max()) + 3, height)
+                if c0 >= c1 or r0 >= r1:
+                    continue
 
-            # Exclude nodata from the weights and keep pixels whose source pixel is
-            # valid. Box blur first when downsampling by 2x or more to avoid aliasing.
-            data = torch.cat([data.where(valid, 0), valid.float()])[None]
-            k = round(np.ptp(rows[:, 0]) / h) | 1, round(np.ptp(cols[0]) / w) | 1
-            if mode != 'nearest' and k != (1, 1):
-                data = F.avg_pool2d(data, k, 1, (k[0] // 2, k[1] // 2))
-            value, weight = sample(data, mode=mode)[0].chunk(2)
-            value = value / weight
-            if array.dtype.kind in 'iu':
-                value = (value + 0.5).floor()
+                window = ((r0, r1), (c0, c1))
+                data = torch.empty((len(group) * n, r1 - r0, c1 - c0), pin_memory=pin)
+                for j, i in enumerate(group):
+                    out = data[j * n : (j + 1) * n].numpy()
+                    srcs[i].read(band_indexes, window=window, out=out)
+                data = data.to(self.device, non_blocking=True)
+                valid = ~data.isnan()
+                if nodata is not None:
+                    valid &= data != nodata
+                grid = np.stack([(cols - c0) / (c1 - c0), (rows - r0) / (r1 - r0)])
+                grid = torch.tensor(grid[None] * 2 - 1, dtype=torch.float32)
+                grid = grid.pin_memory() if pin else grid
+                grid = grid.to(self.device, non_blocking=True)
+                grid = F.interpolate(grid, (h, w), mode='bilinear', align_corners=True)
+                sample = functools.partial(
+                    F.grid_sample, grid=grid.permute(0, 2, 3, 1), align_corners=False
+                )
 
-            dest = outs[-1]
-            keep = sample(valid[None].float(), mode='nearest')[0] > 0
-            keep &= dest.isnan() | (dest == fill)
-            outs[-1] = torch.where(keep, value, dest)
+                # Exclude nodata from the weights and keep pixels whose source pixel
+                # is valid. Box blur first when downsampling by 2x or more to avoid
+                # aliasing.
+                data = torch.cat([data.where(valid, 0), valid])[None]
+                keep = sample(data[:, len(valid) :], mode='nearest')[0] > 0
+                k = round(np.ptp(rows[:, 0]) / h) | 1, round(np.ptp(cols[0]) / w) | 1
+                if mode != 'nearest' and k != (1, 1):
+                    data = F.avg_pool2d(data, k, 1, (k[0] // 2, k[1] // 2))
+                value, weight = sample(data, mode=mode)[0].chunk(2)
+                value = value / weight
+                if np.dtype(srcs[group[0]].dtypes[0]).kind in 'iu':
+                    value = (value + 0.5).floor()
+
+                bands = [i * n + b for i in group for b in range(n)]
+                dest = outs[-1][bands]
+                if not first:
+                    keep &= dest.isnan() | (dest == fill)
+                outs[-1][bands] = torch.where(keep, value, dest)
 
         return torch.stack(outs) if self.time_series else outs[0]
 
